@@ -64,8 +64,8 @@ pub const SqliteError = error{
     MultipleStatements,
 };
 
-/// Map a raw SQLite result code to a typed error.
-/// Handles both primary and extended result codes.
+/// Extended result codes must be matched before their primary codes
+/// because SQLite extended codes embed the primary code in the low byte.
 pub fn errorFromCode(rc: c_int) SqliteError {
     return switch (rc) {
         c.SQLITE_CONSTRAINT_CHECK => SqliteError.ConstraintCheck,
@@ -209,12 +209,8 @@ pub const Database = struct {
     pub fn execZ(self: *Database, sql: [:0]const u8) !void {
         var err_msg: [*c]u8 = null;
         const rc = c.sqlite3_exec(self.handle, sql, null, null, &err_msg);
-        if (err_msg != null) {
-            c.sqlite3_free(err_msg);
-        }
-        if (rc != c.SQLITE_OK) {
-            return errorFromCode(rc);
-        }
+        if (err_msg) |msg| c.sqlite3_free(msg);
+        if (rc != c.SQLITE_OK) return errorFromCode(rc);
     }
 
     pub fn prepare(self: *Database, sql: []const u8) !Statement {
@@ -230,11 +226,8 @@ pub const Database = struct {
     }
 
     pub fn getErrorMessage(self: *Database) []const u8 {
-        const msg = c.sqlite3_errmsg(self.handle);
-        if (msg) |m| {
-            return std.mem.sliceTo(m, 0);
-        }
-        return "unknown error";
+        const msg = c.sqlite3_errmsg(self.handle) orelse return "unknown error";
+        return std.mem.sliceTo(msg, 0);
     }
 };
 
@@ -261,21 +254,20 @@ pub const Statement = struct {
         }
 
         if (comptime builtin.mode == .Debug) {
-            const tail_addr = @intFromPtr(tail);
             const sql_end = @intFromPtr(sql.ptr) + sql.len;
-            if (tail != null and tail_addr < sql_end) {
-                const remaining_len: c_int = @intCast(sql_end - tail_addr);
+            const tail_addr = @intFromPtr(tail);
+            if (tail_addr < sql_end) {
                 var tail_stmt: ?*c.sqlite3_stmt = null;
-                _ = c.sqlite3_prepare_v2(db.handle, tail, remaining_len, &tail_stmt, null);
-                if (tail_stmt != null) {
-                    _ = c.sqlite3_finalize(tail_stmt);
+                _ = c.sqlite3_prepare_v2(db.handle, tail, @intCast(sql_end - tail_addr), &tail_stmt, null);
+                if (tail_stmt) |ts| {
+                    _ = c.sqlite3_finalize(ts);
                     _ = c.sqlite3_finalize(stmt.?);
                     return SqliteError.MultipleStatements;
                 }
             }
         }
 
-        return Statement{ .stmt = stmt.?, .db = db };
+        return .{ .stmt = stmt.?, .db = db };
     }
 
     pub fn deinit(self: *Statement) void {
@@ -363,19 +355,19 @@ pub const Statement = struct {
     // -- Column extraction --
 
     pub fn columnText(self: *Statement, idx: u32) ?[]const u8 {
-        const ptr = c.sqlite3_column_text(self.stmt, @intCast(idx));
-        if (ptr == null) return null;
-        const len = c.sqlite3_column_bytes(self.stmt, @intCast(idx));
+        const col: c_int = @intCast(idx);
+        const ptr = c.sqlite3_column_text(self.stmt, col) orelse return null;
+        const len = c.sqlite3_column_bytes(self.stmt, col);
         if (len <= 0) return null;
         return ptr[0..@intCast(len)];
     }
 
     pub fn columnBlob(self: *Statement, idx: u32) ?[]const u8 {
-        const raw = c.sqlite3_column_blob(self.stmt, @intCast(idx));
-        if (raw == null) return null;
-        const len = c.sqlite3_column_bytes(self.stmt, @intCast(idx));
+        const col: c_int = @intCast(idx);
+        const raw = c.sqlite3_column_blob(self.stmt, col) orelse return null;
+        const len = c.sqlite3_column_bytes(self.stmt, col);
         if (len <= 0) return null;
-        const ptr: [*]const u8 = @ptrCast(raw.?);
+        const ptr: [*]const u8 = @ptrCast(raw);
         return ptr[0..@intCast(len)];
     }
 
@@ -391,25 +383,20 @@ pub const Statement = struct {
         return c.sqlite3_column_double(self.stmt, @intCast(idx));
     }
 
+    pub fn columnIsNull(self: *Statement, idx: u32) bool {
+        return self.columnType(idx) == .null;
+    }
+
     pub fn columnOptionalInt(self: *Statement, idx: u32) ?i64 {
-        if (c.sqlite3_column_type(self.stmt, @intCast(idx)) == c.SQLITE_NULL) {
-            return null;
-        }
-        return self.columnInt(idx);
+        return if (self.columnIsNull(idx)) null else self.columnInt(idx);
     }
 
     pub fn columnOptionalInt32(self: *Statement, idx: u32) ?i32 {
-        if (c.sqlite3_column_type(self.stmt, @intCast(idx)) == c.SQLITE_NULL) {
-            return null;
-        }
-        return self.columnInt32(idx);
+        return if (self.columnIsNull(idx)) null else self.columnInt32(idx);
     }
 
     pub fn columnOptionalFloat(self: *Statement, idx: u32) ?f64 {
-        if (c.sqlite3_column_type(self.stmt, @intCast(idx)) == c.SQLITE_NULL) {
-            return null;
-        }
-        return self.columnFloat(idx);
+        return if (self.columnIsNull(idx)) null else self.columnFloat(idx);
     }
 
     pub fn columnBool(self: *Statement, idx: u32) bool {
@@ -423,11 +410,8 @@ pub const Statement = struct {
     }
 
     pub fn columnName(self: *Statement, idx: u32) ?[]const u8 {
-        const raw = c.sqlite3_column_name(self.stmt, @intCast(idx));
-        if (raw) |name| {
-            return std.mem.sliceTo(name, 0);
-        }
-        return null;
+        const name = c.sqlite3_column_name(self.stmt, @intCast(idx)) orelse return null;
+        return std.mem.sliceTo(name, 0);
     }
 
     pub fn columnType(self: *Statement, idx: u32) ColumnType {
