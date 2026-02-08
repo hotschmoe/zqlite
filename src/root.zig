@@ -161,8 +161,7 @@ pub const ColumnType = enum(c_int) {
     null = c.SQLITE_NULL,
 };
 
-/// Marker type for binding blob data via comptime tuple binding.
-/// Use Blob{.data = slice} to distinguish blob from text ([]const u8).
+/// Distinguishes blob from text ([]const u8) in comptime tuple binding.
 pub const Blob = struct {
     data: ?[]const u8,
 };
@@ -248,12 +247,7 @@ pub const Database = struct {
         return Rows{ .stmt = stmt };
     }
 
-    /// Execute a query expecting at most one row.
-    /// Returns a Rows iterator -- call next() once to get the Row, then deinit().
-    /// Pattern:
-    ///   var result = try db.row("SELECT ... WHERE id = ?1", .{id});
-    ///   defer result.deinit();
-    ///   if (result.next()) |r| { const name = r.text(0); }
+    /// Execute a query expecting at most one row. Alias for rows().
     pub fn row(self: *Database, sql: []const u8, args: anytype) !Rows {
         return self.rows(sql, args);
     }
@@ -395,7 +389,7 @@ pub const Statement = struct {
 
     // -- Comptime tuple binding --
 
-    /// Bind all fields of a tuple to positional parameters (1-indexed).
+    /// Bind all tuple fields to positional parameters (?1, ?2, ...).
     pub fn bind(self: *Statement, args: anytype) !void {
         const Args = @TypeOf(args);
         const fields = @typeInfo(Args).@"struct".fields;
@@ -441,13 +435,11 @@ pub const Statement = struct {
             .pointer => |ptr| {
                 if (ptr.size == .slice and ptr.child == u8) {
                     try self.bindText(idx, value);
-                } else if (ptr.size == .one) {
-                    const child_info = @typeInfo(ptr.child);
-                    if (child_info == .array and child_info.array.child == u8) {
-                        try self.bindText(idx, value);
-                    } else {
-                        @compileError("unsupported pointer type for binding");
-                    }
+                } else if (ptr.size == .one and
+                    @typeInfo(ptr.child) == .array and
+                    @typeInfo(ptr.child).array.child == u8)
+                {
+                    try self.bindText(idx, value);
                 } else {
                     @compileError("unsupported pointer type for binding");
                 }
@@ -658,25 +650,16 @@ pub const Pool = struct {
         errdefer allocator.free(available);
 
         var initialized: usize = 0;
-        errdefer {
-            var j: usize = 0;
-            while (j < initialized) : (j += 1) {
-                connections[j].close();
-            }
-        }
+        errdefer for (connections[0..initialized]) |*conn| conn.close();
 
         for (connections, 0..) |*conn, i| {
             conn.* = try Database.openWithFlags(allocator, config.path, config.flags);
             initialized = i + 1;
 
             if (i == 0) {
-                if (config.on_first_connection) |cb| {
-                    try cb(conn);
-                }
+                if (config.on_first_connection) |cb| try cb(conn);
             }
-            if (config.on_connection) |cb| {
-                try cb(conn);
-            }
+            if (config.on_connection) |cb| try cb(conn);
             available[i] = i;
         }
 
@@ -1870,11 +1853,6 @@ test "Pool on_first_connection fires once" {
     });
     defer pool.deinit();
 
-    // on_first_connection created the table, on_connection inserted 3 rows (one per connection).
-    // The table existing proves on_first_connection ran. Having 3 rows proves on_connection
-    // ran for each connection. If on_first_connection ran more than once, the CREATE TABLE
-    // IF NOT EXISTS would still succeed, but having exactly 3 rows from on_connection
-    // confirms on_connection ran 3 times total.
     const conn = pool.acquire();
     var stmt = try conn.prepare("SELECT COUNT(*) FROM pool_cb_track");
     defer stmt.deinit();
