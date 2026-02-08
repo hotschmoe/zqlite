@@ -6,43 +6,182 @@
 //! - Transaction support with automatic rollback
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
-// SQLITE_TRANSIENT is ((sqlite3_destructor_type)-1) in C.
-// Zig's c_translation cannot safely cast this on cross-compile targets
-// due to function-pointer alignment checks. Define it directly.
-// Use SQLITE_STATIC (null) instead of SQLITE_TRANSIENT.
-// SQLITE_TRANSIENT is ((sqlite3_destructor_type)-1) which Zig cannot
+// SQLITE_STATIC (null) instead of SQLITE_TRANSIENT which Zig cannot
 // represent as a function pointer on cross-compile targets (alignment).
-// SQLITE_STATIC is safe here: callers always step() before releasing
-// bound text data, so the pointer remains valid through execution.
 const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
 pub const SqliteError = error{
-    OpenFailed,
-    PrepareFailed,
-    BindFailed,
-    StepFailed,
-    ExecuteFailed,
+    // Primary result codes
+    Error, // SQLITE_ERROR (1)
+    Internal, // SQLITE_INTERNAL (2)
+    Perm, // SQLITE_PERM (3)
+    Abort, // SQLITE_ABORT (4)
+    Busy, // SQLITE_BUSY (5)
+    Locked, // SQLITE_LOCKED (6)
+    NoMem, // SQLITE_NOMEM (7)
+    ReadOnly, // SQLITE_READONLY (8)
+    Interrupt, // SQLITE_INTERRUPT (9)
+    IoErr, // SQLITE_IOERR (10)
+    Corrupt, // SQLITE_CORRUPT (11)
+    NotFound, // SQLITE_NOTFOUND (12)
+    Full, // SQLITE_FULL (13)
+    CantOpen, // SQLITE_CANTOPEN (14)
+    Protocol, // SQLITE_PROTOCOL (15)
+    Schema, // SQLITE_SCHEMA (17)
+    TooBig, // SQLITE_TOOBIG (18)
+    Constraint, // SQLITE_CONSTRAINT (19)
+    Mismatch, // SQLITE_MISMATCH (20)
+    Misuse, // SQLITE_MISUSE (21)
+    Auth, // SQLITE_AUTH (23)
+    Range, // SQLITE_RANGE (25)
+    NotADb, // SQLITE_NOTADB (26)
+
+    // Extended: constraint subtypes
+    ConstraintCheck,
+    ConstraintCommitHook,
+    ConstraintForeignKey,
+    ConstraintNotNull,
+    ConstraintPrimaryKey,
+    ConstraintTrigger,
+    ConstraintUnique,
+    ConstraintRowId,
+
+    // Extended: busy subtypes
+    BusyRecovery,
+    BusySnapshot,
     BusyTimeout,
-    Corrupt,
+
+    // Debug-only
+    MultipleStatements,
 };
+
+/// Map a raw SQLite result code to a typed error.
+/// Handles both primary and extended result codes.
+pub fn errorFromCode(rc: c_int) SqliteError {
+    return switch (rc) {
+        c.SQLITE_CONSTRAINT_CHECK => SqliteError.ConstraintCheck,
+        c.SQLITE_CONSTRAINT_COMMITHOOK => SqliteError.ConstraintCommitHook,
+        c.SQLITE_CONSTRAINT_FOREIGNKEY => SqliteError.ConstraintForeignKey,
+        c.SQLITE_CONSTRAINT_NOTNULL => SqliteError.ConstraintNotNull,
+        c.SQLITE_CONSTRAINT_PRIMARYKEY => SqliteError.ConstraintPrimaryKey,
+        c.SQLITE_CONSTRAINT_TRIGGER => SqliteError.ConstraintTrigger,
+        c.SQLITE_CONSTRAINT_UNIQUE => SqliteError.ConstraintUnique,
+        c.SQLITE_CONSTRAINT_ROWID => SqliteError.ConstraintRowId,
+
+        c.SQLITE_BUSY_RECOVERY => SqliteError.BusyRecovery,
+        c.SQLITE_BUSY_SNAPSHOT => SqliteError.BusySnapshot,
+        c.SQLITE_BUSY_TIMEOUT => SqliteError.BusyTimeout,
+
+        c.SQLITE_ERROR => SqliteError.Error,
+        c.SQLITE_INTERNAL => SqliteError.Internal,
+        c.SQLITE_PERM => SqliteError.Perm,
+        c.SQLITE_ABORT => SqliteError.Abort,
+        c.SQLITE_BUSY => SqliteError.Busy,
+        c.SQLITE_LOCKED => SqliteError.Locked,
+        c.SQLITE_NOMEM => SqliteError.NoMem,
+        c.SQLITE_READONLY => SqliteError.ReadOnly,
+        c.SQLITE_INTERRUPT => SqliteError.Interrupt,
+        c.SQLITE_IOERR => SqliteError.IoErr,
+        c.SQLITE_CORRUPT => SqliteError.Corrupt,
+        c.SQLITE_NOTFOUND => SqliteError.NotFound,
+        c.SQLITE_FULL => SqliteError.Full,
+        c.SQLITE_CANTOPEN => SqliteError.CantOpen,
+        c.SQLITE_PROTOCOL => SqliteError.Protocol,
+        c.SQLITE_SCHEMA => SqliteError.Schema,
+        c.SQLITE_TOOBIG => SqliteError.TooBig,
+        c.SQLITE_CONSTRAINT => SqliteError.Constraint,
+        c.SQLITE_MISMATCH => SqliteError.Mismatch,
+        c.SQLITE_MISUSE => SqliteError.Misuse,
+        c.SQLITE_AUTH => SqliteError.Auth,
+        c.SQLITE_RANGE => SqliteError.Range,
+        c.SQLITE_NOTADB => SqliteError.NotADb,
+
+        else => SqliteError.Error,
+    };
+}
+
+pub fn isUnique(err: SqliteError) bool {
+    return err == SqliteError.ConstraintUnique;
+}
+
+pub fn isConstraint(err: SqliteError) bool {
+    return switch (err) {
+        SqliteError.Constraint,
+        SqliteError.ConstraintCheck,
+        SqliteError.ConstraintCommitHook,
+        SqliteError.ConstraintForeignKey,
+        SqliteError.ConstraintNotNull,
+        SqliteError.ConstraintPrimaryKey,
+        SqliteError.ConstraintTrigger,
+        SqliteError.ConstraintUnique,
+        SqliteError.ConstraintRowId,
+        => true,
+        else => false,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Open Flags (for sqlite3_open_v2)
+// ---------------------------------------------------------------------------
+
+pub const OpenFlags = struct {
+    pub const READONLY: c_int = c.SQLITE_OPEN_READONLY;
+    pub const READWRITE: c_int = c.SQLITE_OPEN_READWRITE;
+    pub const CREATE: c_int = c.SQLITE_OPEN_CREATE;
+    pub const URI: c_int = c.SQLITE_OPEN_URI;
+    pub const MEMORY: c_int = c.SQLITE_OPEN_MEMORY;
+    pub const NOMUTEX: c_int = c.SQLITE_OPEN_NOMUTEX;
+    pub const FULLMUTEX: c_int = c.SQLITE_OPEN_FULLMUTEX;
+    pub const SHAREDCACHE: c_int = c.SQLITE_OPEN_SHAREDCACHE;
+    pub const PRIVATECACHE: c_int = c.SQLITE_OPEN_PRIVATECACHE;
+    pub const NOFOLLOW: c_int = c.SQLITE_OPEN_NOFOLLOW;
+    pub const EXRESCODE: c_int = c.SQLITE_OPEN_EXRESCODE;
+
+    pub const DEFAULT: c_int = READWRITE | CREATE | EXRESCODE;
+};
+
+// ---------------------------------------------------------------------------
+// Column Type
+// ---------------------------------------------------------------------------
+
+pub const ColumnType = enum(c_int) {
+    integer = c.SQLITE_INTEGER,
+    float = c.SQLITE_FLOAT,
+    text = c.SQLITE3_TEXT,
+    blob = c.SQLITE_BLOB,
+    null = c.SQLITE_NULL,
+};
+
+// ---------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------
 
 pub const Database = struct {
     handle: *c.sqlite3,
     allocator: std.mem.Allocator,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !Database {
+        return openWithFlags(allocator, path, OpenFlags.DEFAULT);
+    }
+
+    pub fn openWithFlags(allocator: std.mem.Allocator, path: []const u8, flags: c_int) !Database {
         var db: ?*c.sqlite3 = null;
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
 
-        const rc = c.sqlite3_open(path_z, &db);
+        const rc = c.sqlite3_open_v2(path_z, &db, flags, null);
         if (rc != c.SQLITE_OK) {
             if (db) |d| _ = c.sqlite3_close(d);
-            return SqliteError.OpenFailed;
+            return errorFromCode(rc);
         }
 
         var self = Database{ .handle = db.?, .allocator = allocator };
@@ -74,10 +213,7 @@ pub const Database = struct {
             c.sqlite3_free(err_msg);
         }
         if (rc != c.SQLITE_OK) {
-            return if (rc == c.SQLITE_BUSY or rc == c.SQLITE_LOCKED)
-                SqliteError.BusyTimeout
-            else
-                SqliteError.ExecuteFailed;
+            return errorFromCode(rc);
         }
     }
 
@@ -102,28 +238,51 @@ pub const Database = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Statement
+// ---------------------------------------------------------------------------
+
 pub const Statement = struct {
     stmt: *c.sqlite3_stmt,
     db: *Database,
 
     pub fn init(db: *Database, sql: []const u8) !Statement {
         var stmt: ?*c.sqlite3_stmt = null;
+        var tail: [*c]const u8 = undefined;
         const rc = c.sqlite3_prepare_v2(
             db.handle,
             sql.ptr,
             @intCast(sql.len),
             &stmt,
-            null,
+            &tail,
         );
         if (rc != c.SQLITE_OK or stmt == null) {
-            return SqliteError.PrepareFailed;
+            return errorFromCode(if (rc != c.SQLITE_OK) rc else c.SQLITE_ERROR);
         }
+
+        if (comptime builtin.mode == .Debug) {
+            const tail_addr = @intFromPtr(tail);
+            const sql_end = @intFromPtr(sql.ptr) + sql.len;
+            if (tail != null and tail_addr < sql_end) {
+                const remaining_len: c_int = @intCast(sql_end - tail_addr);
+                var tail_stmt: ?*c.sqlite3_stmt = null;
+                _ = c.sqlite3_prepare_v2(db.handle, tail, remaining_len, &tail_stmt, null);
+                if (tail_stmt != null) {
+                    _ = c.sqlite3_finalize(tail_stmt);
+                    _ = c.sqlite3_finalize(stmt.?);
+                    return SqliteError.MultipleStatements;
+                }
+            }
+        }
+
         return Statement{ .stmt = stmt.?, .db = db };
     }
 
     pub fn deinit(self: *Statement) void {
         _ = c.sqlite3_finalize(self.stmt);
     }
+
+    // -- Binding --
 
     pub fn bindText(self: *Statement, idx: u32, value: ?[]const u8) !void {
         const rc = if (value) |v|
@@ -136,22 +295,41 @@ pub const Statement = struct {
             )
         else
             c.sqlite3_bind_null(self.stmt, @intCast(idx));
-        if (rc != c.SQLITE_OK) return SqliteError.BindFailed;
+        if (rc != c.SQLITE_OK) return errorFromCode(rc);
+    }
+
+    pub fn bindBlob(self: *Statement, idx: u32, value: ?[]const u8) !void {
+        const rc = if (value) |v|
+            c.sqlite3_bind_blob(
+                self.stmt,
+                @intCast(idx),
+                @ptrCast(v.ptr),
+                @intCast(v.len),
+                SQLITE_STATIC,
+            )
+        else
+            c.sqlite3_bind_null(self.stmt, @intCast(idx));
+        if (rc != c.SQLITE_OK) return errorFromCode(rc);
     }
 
     pub fn bindInt(self: *Statement, idx: u32, value: i64) !void {
         const rc = c.sqlite3_bind_int64(self.stmt, @intCast(idx), value);
-        if (rc != c.SQLITE_OK) return SqliteError.BindFailed;
+        if (rc != c.SQLITE_OK) return errorFromCode(rc);
     }
 
     pub fn bindInt32(self: *Statement, idx: u32, value: i32) !void {
         const rc = c.sqlite3_bind_int(self.stmt, @intCast(idx), value);
-        if (rc != c.SQLITE_OK) return SqliteError.BindFailed;
+        if (rc != c.SQLITE_OK) return errorFromCode(rc);
+    }
+
+    pub fn bindFloat(self: *Statement, idx: u32, value: f64) !void {
+        const rc = c.sqlite3_bind_double(self.stmt, @intCast(idx), value);
+        if (rc != c.SQLITE_OK) return errorFromCode(rc);
     }
 
     pub fn bindNull(self: *Statement, idx: u32) !void {
         const rc = c.sqlite3_bind_null(self.stmt, @intCast(idx));
-        if (rc != c.SQLITE_OK) return SqliteError.BindFailed;
+        if (rc != c.SQLITE_OK) return errorFromCode(rc);
     }
 
     pub fn bindOptionalInt(self: *Statement, idx: u32, value: ?i64) !void {
@@ -170,9 +348,19 @@ pub const Statement = struct {
         }
     }
 
+    pub fn bindOptionalFloat(self: *Statement, idx: u32, value: ?f64) !void {
+        if (value) |v| {
+            try self.bindFloat(idx, v);
+        } else {
+            try self.bindNull(idx);
+        }
+    }
+
     pub fn bindBool(self: *Statement, idx: u32, value: bool) !void {
         try self.bindInt(idx, if (value) 1 else 0);
     }
+
+    // -- Column extraction --
 
     pub fn columnText(self: *Statement, idx: u32) ?[]const u8 {
         const ptr = c.sqlite3_column_text(self.stmt, @intCast(idx));
@@ -182,12 +370,25 @@ pub const Statement = struct {
         return ptr[0..@intCast(len)];
     }
 
+    pub fn columnBlob(self: *Statement, idx: u32) ?[]const u8 {
+        const raw = c.sqlite3_column_blob(self.stmt, @intCast(idx));
+        if (raw == null) return null;
+        const len = c.sqlite3_column_bytes(self.stmt, @intCast(idx));
+        if (len <= 0) return null;
+        const ptr: [*]const u8 = @ptrCast(raw.?);
+        return ptr[0..@intCast(len)];
+    }
+
     pub fn columnInt(self: *Statement, idx: u32) i64 {
         return c.sqlite3_column_int64(self.stmt, @intCast(idx));
     }
 
     pub fn columnInt32(self: *Statement, idx: u32) i32 {
         return c.sqlite3_column_int(self.stmt, @intCast(idx));
+    }
+
+    pub fn columnFloat(self: *Statement, idx: u32) f64 {
+        return c.sqlite3_column_double(self.stmt, @intCast(idx));
     }
 
     pub fn columnOptionalInt(self: *Statement, idx: u32) ?i64 {
@@ -204,18 +405,43 @@ pub const Statement = struct {
         return self.columnInt32(idx);
     }
 
+    pub fn columnOptionalFloat(self: *Statement, idx: u32) ?f64 {
+        if (c.sqlite3_column_type(self.stmt, @intCast(idx)) == c.SQLITE_NULL) {
+            return null;
+        }
+        return self.columnFloat(idx);
+    }
+
     pub fn columnBool(self: *Statement, idx: u32) bool {
         return self.columnInt(idx) != 0;
     }
+
+    // -- Column metadata --
+
+    pub fn columnCount(self: *Statement) u32 {
+        return @intCast(c.sqlite3_column_count(self.stmt));
+    }
+
+    pub fn columnName(self: *Statement, idx: u32) ?[]const u8 {
+        const raw = c.sqlite3_column_name(self.stmt, @intCast(idx));
+        if (raw) |name| {
+            return std.mem.sliceTo(name, 0);
+        }
+        return null;
+    }
+
+    pub fn columnType(self: *Statement, idx: u32) ColumnType {
+        return @enumFromInt(c.sqlite3_column_type(self.stmt, @intCast(idx)));
+    }
+
+    // -- Step and reset --
 
     pub fn step(self: *Statement) !bool {
         const rc = c.sqlite3_step(self.stmt);
         return switch (rc) {
             c.SQLITE_ROW => true,
             c.SQLITE_DONE => false,
-            c.SQLITE_BUSY, c.SQLITE_LOCKED => SqliteError.BusyTimeout,
-            c.SQLITE_CORRUPT, c.SQLITE_NOTADB => SqliteError.Corrupt,
-            else => SqliteError.StepFailed,
+            else => errorFromCode(rc),
         };
     }
 
@@ -225,8 +451,10 @@ pub const Statement = struct {
     }
 };
 
-/// Execute a function within a transaction.
-/// Commits on success, rolls back on error.
+// ---------------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------------
+
 pub fn transaction(db: *Database, ctx: anytype, comptime f: fn (@TypeOf(ctx), *Database) anyerror!void) !void {
     try db.exec("BEGIN IMMEDIATE");
     f(ctx, db) catch |err| {
@@ -236,7 +464,6 @@ pub fn transaction(db: *Database, ctx: anytype, comptime f: fn (@TypeOf(ctx), *D
     try db.exec("COMMIT");
 }
 
-/// Execute a function within a transaction (no context version).
 pub fn transactionSimple(db: *Database, comptime f: fn (*Database) anyerror!void) !void {
     try db.exec("BEGIN IMMEDIATE");
     f(db) catch |err| {
@@ -245,6 +472,10 @@ pub fn transactionSimple(db: *Database, comptime f: fn (*Database) anyerror!void
     };
     try db.exec("COMMIT");
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 test "Database open and close in-memory" {
     const allocator = std.testing.allocator;
@@ -435,4 +666,396 @@ test "bindBool helper" {
 
     _ = try select_stmt.step();
     try std.testing.expect(!select_stmt.columnBool(0));
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Granular Error Types
+// ---------------------------------------------------------------------------
+
+test "errorFromCode maps known codes correctly" {
+    try std.testing.expectEqual(SqliteError.ConstraintUnique, errorFromCode(c.SQLITE_CONSTRAINT_UNIQUE));
+    try std.testing.expectEqual(SqliteError.ConstraintForeignKey, errorFromCode(c.SQLITE_CONSTRAINT_FOREIGNKEY));
+    try std.testing.expectEqual(SqliteError.ConstraintPrimaryKey, errorFromCode(c.SQLITE_CONSTRAINT_PRIMARYKEY));
+    try std.testing.expectEqual(SqliteError.ConstraintNotNull, errorFromCode(c.SQLITE_CONSTRAINT_NOTNULL));
+    try std.testing.expectEqual(SqliteError.ConstraintCheck, errorFromCode(c.SQLITE_CONSTRAINT_CHECK));
+    try std.testing.expectEqual(SqliteError.BusyTimeout, errorFromCode(c.SQLITE_BUSY_TIMEOUT));
+    try std.testing.expectEqual(SqliteError.BusyRecovery, errorFromCode(c.SQLITE_BUSY_RECOVERY));
+    try std.testing.expectEqual(SqliteError.Corrupt, errorFromCode(c.SQLITE_CORRUPT));
+    try std.testing.expectEqual(SqliteError.Misuse, errorFromCode(c.SQLITE_MISUSE));
+}
+
+test "errorFromCode maps unknown code to Error" {
+    try std.testing.expectEqual(SqliteError.Error, errorFromCode(9999));
+}
+
+test "isUnique returns true for ConstraintUnique" {
+    try std.testing.expect(isUnique(SqliteError.ConstraintUnique));
+}
+
+test "isUnique returns false for other errors" {
+    try std.testing.expect(!isUnique(SqliteError.ConstraintForeignKey));
+    try std.testing.expect(!isUnique(SqliteError.ConstraintPrimaryKey));
+    try std.testing.expect(!isUnique(SqliteError.Constraint));
+    try std.testing.expect(!isUnique(SqliteError.Error));
+    try std.testing.expect(!isUnique(SqliteError.Busy));
+}
+
+test "isConstraint returns true for all constraint variants" {
+    try std.testing.expect(isConstraint(SqliteError.Constraint));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintCheck));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintCommitHook));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintForeignKey));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintNotNull));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintPrimaryKey));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintTrigger));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintUnique));
+    try std.testing.expect(isConstraint(SqliteError.ConstraintRowId));
+}
+
+test "isConstraint returns false for non-constraint errors" {
+    try std.testing.expect(!isConstraint(SqliteError.Error));
+    try std.testing.expect(!isConstraint(SqliteError.Busy));
+    try std.testing.expect(!isConstraint(SqliteError.BusyTimeout));
+    try std.testing.expect(!isConstraint(SqliteError.Corrupt));
+}
+
+test "unique constraint violation produces ConstraintUnique" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE uniq_test (id INTEGER PRIMARY KEY, val TEXT UNIQUE)");
+    try db.exec("INSERT INTO uniq_test (val) VALUES ('duplicate')");
+
+    var stmt = try db.prepare("INSERT INTO uniq_test (val) VALUES (?1)");
+    defer stmt.deinit();
+
+    try stmt.bindText(1, "duplicate");
+    const result = stmt.step();
+    try std.testing.expectError(SqliteError.ConstraintUnique, result);
+}
+
+test "foreign key violation produces ConstraintForeignKey" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE parent (id INTEGER PRIMARY KEY)");
+    try db.exec("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))");
+
+    var stmt = try db.prepare("INSERT INTO child (parent_id) VALUES (?1)");
+    defer stmt.deinit();
+
+    try stmt.bindInt(1, 999);
+    const result = stmt.step();
+    try std.testing.expectError(SqliteError.ConstraintForeignKey, result);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Blob Binding/Extraction
+// ---------------------------------------------------------------------------
+
+test "bindBlob and columnBlob round-trip" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE blob_test (id INTEGER PRIMARY KEY, data BLOB)");
+
+    const blob_data = &[_]u8{ 0x00, 0x01, 0x02, 0xFF, 0xFE, 0x00, 0x42 };
+
+    var insert_stmt = try db.prepare("INSERT INTO blob_test (data) VALUES (?1)");
+    defer insert_stmt.deinit();
+    try insert_stmt.bindBlob(1, blob_data);
+    _ = try insert_stmt.step();
+
+    var select_stmt = try db.prepare("SELECT data FROM blob_test WHERE id = 1");
+    defer select_stmt.deinit();
+    const has_row = try select_stmt.step();
+    try std.testing.expect(has_row);
+
+    const result = select_stmt.columnBlob(0);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualSlices(u8, blob_data, result.?);
+}
+
+test "bindBlob with null" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE blob_test (id INTEGER PRIMARY KEY, data BLOB)");
+
+    var insert_stmt = try db.prepare("INSERT INTO blob_test (data) VALUES (?1)");
+    defer insert_stmt.deinit();
+    try insert_stmt.bindBlob(1, null);
+    _ = try insert_stmt.step();
+
+    var select_stmt = try db.prepare("SELECT data FROM blob_test WHERE id = 1");
+    defer select_stmt.deinit();
+    _ = try select_stmt.step();
+
+    const result = select_stmt.columnBlob(0);
+    try std.testing.expect(result == null);
+}
+
+test "bindBlob binary data with zero bytes" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE blob_test (id INTEGER PRIMARY KEY, data BLOB)");
+
+    const binary = &[_]u8{ 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 };
+
+    var insert_stmt = try db.prepare("INSERT INTO blob_test (data) VALUES (?1)");
+    defer insert_stmt.deinit();
+    try insert_stmt.bindBlob(1, binary);
+    _ = try insert_stmt.step();
+
+    var select_stmt = try db.prepare("SELECT data FROM blob_test WHERE id = 1");
+    defer select_stmt.deinit();
+    _ = try select_stmt.step();
+
+    const result = select_stmt.columnBlob(0);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(usize, 6), result.?.len);
+    try std.testing.expectEqualSlices(u8, binary, result.?);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Float/Double Support
+// ---------------------------------------------------------------------------
+
+test "bindFloat and columnFloat round-trip" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE float_test (id INTEGER PRIMARY KEY, val REAL)");
+
+    var insert_stmt = try db.prepare("INSERT INTO float_test (val) VALUES (?1)");
+    defer insert_stmt.deinit();
+    try insert_stmt.bindFloat(1, 3.14159265358979);
+    _ = try insert_stmt.step();
+
+    var select_stmt = try db.prepare("SELECT val FROM float_test WHERE id = 1");
+    defer select_stmt.deinit();
+    _ = try select_stmt.step();
+
+    const val = select_stmt.columnFloat(0);
+    try std.testing.expectApproxEqRel(@as(f64, 3.14159265358979), val, 1e-12);
+}
+
+test "columnOptionalFloat returns null for NULL" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE float_test (id INTEGER PRIMARY KEY, val REAL)");
+    try db.exec("INSERT INTO float_test (val) VALUES (NULL)");
+
+    var stmt = try db.prepare("SELECT val FROM float_test WHERE id = 1");
+    defer stmt.deinit();
+    _ = try stmt.step();
+
+    const val = stmt.columnOptionalFloat(0);
+    try std.testing.expect(val == null);
+}
+
+test "columnOptionalFloat returns value for non-NULL" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE float_test (id INTEGER PRIMARY KEY, val REAL)");
+    try db.exec("INSERT INTO float_test (val) VALUES (2.718281828)");
+
+    var stmt = try db.prepare("SELECT val FROM float_test WHERE id = 1");
+    defer stmt.deinit();
+    _ = try stmt.step();
+
+    const val = stmt.columnOptionalFloat(0);
+    try std.testing.expect(val != null);
+    try std.testing.expectApproxEqRel(@as(f64, 2.718281828), val.?, 1e-9);
+}
+
+test "bindOptionalFloat with value and null" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE float_test (id INTEGER PRIMARY KEY, val REAL)");
+
+    var stmt = try db.prepare("INSERT INTO float_test (val) VALUES (?1)");
+    defer stmt.deinit();
+
+    try stmt.bindOptionalFloat(1, @as(?f64, 1.5));
+    _ = try stmt.step();
+    stmt.reset();
+
+    try stmt.bindOptionalFloat(1, @as(?f64, null));
+    _ = try stmt.step();
+
+    var select_stmt = try db.prepare("SELECT val FROM float_test ORDER BY id");
+    defer select_stmt.deinit();
+
+    _ = try select_stmt.step();
+    const first = select_stmt.columnOptionalFloat(0);
+    try std.testing.expect(first != null);
+    try std.testing.expectApproxEqRel(@as(f64, 1.5), first.?, 1e-12);
+
+    _ = try select_stmt.step();
+    const second = select_stmt.columnOptionalFloat(0);
+    try std.testing.expect(second == null);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Multi-Statement Detection (Debug mode only)
+// ---------------------------------------------------------------------------
+
+test "multi-statement detection rejects multiple statements" {
+    if (comptime builtin.mode == .Debug) {
+        const allocator = std.testing.allocator;
+        var db = try Database.open(allocator, ":memory:");
+        defer db.close();
+
+        const result = db.prepare("SELECT 1; SELECT 2");
+        try std.testing.expectError(SqliteError.MultipleStatements, result);
+    }
+}
+
+test "multi-statement detection allows single statement" {
+    if (comptime builtin.mode == .Debug) {
+        const allocator = std.testing.allocator;
+        var db = try Database.open(allocator, ":memory:");
+        defer db.close();
+
+        var stmt = try db.prepare("SELECT 1");
+        defer stmt.deinit();
+        const has_row = try stmt.step();
+        try std.testing.expect(has_row);
+    }
+}
+
+test "multi-statement detection allows trailing whitespace and semicolons" {
+    if (comptime builtin.mode == .Debug) {
+        const allocator = std.testing.allocator;
+        var db = try Database.open(allocator, ":memory:");
+        defer db.close();
+
+        var stmt1 = try db.prepare("SELECT 1;");
+        defer stmt1.deinit();
+
+        var stmt2 = try db.prepare("SELECT 1;  ");
+        defer stmt2.deinit();
+
+        var stmt3 = try db.prepare("SELECT 1 ");
+        defer stmt3.deinit();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Configurable Open Flags
+// ---------------------------------------------------------------------------
+
+test "openWithFlags with default flags" {
+    const allocator = std.testing.allocator;
+    var db = try Database.openWithFlags(allocator, ":memory:", OpenFlags.DEFAULT);
+    defer db.close();
+
+    try db.exec("CREATE TABLE test (id INTEGER PRIMARY KEY)");
+}
+
+test "openWithFlags with READONLY on existing database" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/readonly_test.db", .{db_path});
+    defer allocator.free(full_path);
+
+    {
+        var db = try Database.open(allocator, full_path);
+        try db.exec("CREATE TABLE test (id INTEGER PRIMARY KEY, val TEXT)");
+        try db.exec("INSERT INTO test (val) VALUES ('hello')");
+        db.close();
+    }
+
+    var ro_db = try Database.openWithFlags(allocator, full_path, OpenFlags.READONLY | OpenFlags.EXRESCODE);
+    defer ro_db.close();
+
+    var stmt = try ro_db.prepare("SELECT val FROM test");
+    defer stmt.deinit();
+    const has_row = try stmt.step();
+    try std.testing.expect(has_row);
+    try std.testing.expectEqualStrings("hello", stmt.columnText(0).?);
+}
+
+test "OpenFlags constants are non-zero" {
+    try std.testing.expect(OpenFlags.READONLY != 0);
+    try std.testing.expect(OpenFlags.READWRITE != 0);
+    try std.testing.expect(OpenFlags.CREATE != 0);
+    try std.testing.expect(OpenFlags.URI != 0);
+    try std.testing.expect(OpenFlags.MEMORY != 0);
+    try std.testing.expect(OpenFlags.NOMUTEX != 0);
+    try std.testing.expect(OpenFlags.FULLMUTEX != 0);
+    try std.testing.expect(OpenFlags.EXRESCODE != 0);
+    try std.testing.expect(OpenFlags.DEFAULT != 0);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Column Metadata
+// ---------------------------------------------------------------------------
+
+test "columnCount returns correct count" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE meta_test (a INTEGER, b TEXT, c REAL)");
+
+    var stmt = try db.prepare("SELECT a, b, c FROM meta_test");
+    defer stmt.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), stmt.columnCount());
+}
+
+test "columnName returns expected names" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE meta_test (alpha INTEGER, beta TEXT, gamma REAL)");
+
+    var stmt = try db.prepare("SELECT alpha, beta, gamma FROM meta_test");
+    defer stmt.deinit();
+
+    try std.testing.expectEqualStrings("alpha", stmt.columnName(0).?);
+    try std.testing.expectEqualStrings("beta", stmt.columnName(1).?);
+    try std.testing.expectEqualStrings("gamma", stmt.columnName(2).?);
+}
+
+test "columnType returns correct types after stepping" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE type_test (i INTEGER, f REAL, t TEXT, b BLOB, n INTEGER)");
+    try db.exec("INSERT INTO type_test VALUES (42, 3.14, 'hello', X'DEADBEEF', NULL)");
+
+    var stmt = try db.prepare("SELECT i, f, t, b, n FROM type_test");
+    defer stmt.deinit();
+
+    const has_row = try stmt.step();
+    try std.testing.expect(has_row);
+
+    try std.testing.expectEqual(ColumnType.integer, stmt.columnType(0));
+    try std.testing.expectEqual(ColumnType.float, stmt.columnType(1));
+    try std.testing.expectEqual(ColumnType.text, stmt.columnType(2));
+    try std.testing.expectEqual(ColumnType.blob, stmt.columnType(3));
+    try std.testing.expectEqual(ColumnType.null, stmt.columnType(4));
 }

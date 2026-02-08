@@ -352,7 +352,12 @@ When making commits, update `version` in `build.zig.zon`:
 - [x] Bundled SQLite amalgamation
 - [x] Cross-platform CI (Linux, macOS, Windows)
 - [x] FTS5 and JSON1 extensions enabled
-- [ ] Blob binding and extraction
+- [x] Blob binding and extraction
+- [x] Float/double support (bindFloat, columnFloat, columnOptionalFloat)
+- [x] Granular error types (35 errors covering primary + extended SQLite codes)
+- [x] Configurable open flags (sqlite3_open_v2 with OpenFlags)
+- [x] Column metadata (columnCount, columnName, columnType)
+- [x] Multi-statement detection (debug mode)
 - [ ] Named parameter binding (`:name`, `@name`, `$name`)
 - [ ] Connection pooling for multi-threaded applications
 - [ ] Migration helper utilities
