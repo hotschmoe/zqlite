@@ -161,6 +161,12 @@ pub const ColumnType = enum(c_int) {
     null = c.SQLITE_NULL,
 };
 
+/// Marker type for binding blob data via comptime tuple binding.
+/// Use Blob{.data = slice} to distinguish blob from text ([]const u8).
+pub const Blob = struct {
+    data: ?[]const u8,
+};
+
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
@@ -215,6 +221,41 @@ pub const Database = struct {
 
     pub fn prepare(self: *Database, sql: []const u8) !Statement {
         return Statement.init(self, sql);
+    }
+
+    /// Prepare, bind, and execute a single DML statement (INSERT/UPDATE/DELETE).
+    pub fn execDml(self: *Database, sql: []const u8, args: anytype) !void {
+        var stmt = try self.prepare(sql);
+        defer stmt.deinit();
+        try stmt.bind(args);
+        _ = try stmt.step();
+    }
+
+    /// Prepare and bind a query, returning the statement ready for stepping.
+    /// Caller owns the returned Statement and must call deinit().
+    pub fn query(self: *Database, sql: []const u8, args: anytype) !Statement {
+        var stmt = try self.prepare(sql);
+        try stmt.bind(args);
+        return stmt;
+    }
+
+    /// Execute a query and return an iterator over the result rows.
+    /// Caller must call deinit() on the returned Rows.
+    pub fn rows(self: *Database, sql: []const u8, args: anytype) !Rows {
+        var stmt = try self.prepare(sql);
+        errdefer stmt.deinit();
+        try stmt.bind(args);
+        return Rows{ .stmt = stmt };
+    }
+
+    /// Execute a query expecting at most one row.
+    /// Returns a Rows iterator -- call next() once to get the Row, then deinit().
+    /// Pattern:
+    ///   var result = try db.row("SELECT ... WHERE id = ?1", .{id});
+    ///   defer result.deinit();
+    ///   if (result.next()) |r| { const name = r.text(0); }
+    pub fn row(self: *Database, sql: []const u8, args: anytype) !Rows {
+        return self.rows(sql, args);
     }
 
     pub fn lastInsertRowId(self: *Database) i64 {
@@ -352,6 +393,69 @@ pub const Statement = struct {
         try self.bindInt(idx, if (value) 1 else 0);
     }
 
+    // -- Comptime tuple binding --
+
+    /// Bind all fields of a tuple to positional parameters (1-indexed).
+    pub fn bind(self: *Statement, args: anytype) !void {
+        const Args = @TypeOf(args);
+        const fields = @typeInfo(Args).@"struct".fields;
+        inline for (fields, 0..) |field, i| {
+            const idx: u32 = @intCast(i + 1);
+            try self.bindField(idx, field.type, @field(args, field.name));
+        }
+    }
+
+    fn bindField(self: *Statement, idx: u32, comptime T: type, value: T) !void {
+        switch (@typeInfo(T)) {
+            .null => try self.bindNull(idx),
+            .bool => try self.bindBool(idx, value),
+            .int => |int_info| {
+                if (int_info.bits <= 32 and int_info.signedness == .signed) {
+                    try self.bindInt32(idx, @intCast(value));
+                } else {
+                    try self.bindInt(idx, @intCast(value));
+                }
+            },
+            .comptime_int => {
+                if (value >= std.math.minInt(i32) and value <= std.math.maxInt(i32)) {
+                    try self.bindInt32(idx, @intCast(value));
+                } else {
+                    try self.bindInt(idx, @intCast(value));
+                }
+            },
+            .float, .comptime_float => try self.bindFloat(idx, @floatCast(value)),
+            .optional => {
+                if (value) |v| {
+                    try self.bindField(idx, @TypeOf(v), v);
+                } else {
+                    try self.bindNull(idx);
+                }
+            },
+            .@"struct" => {
+                if (T == Blob) {
+                    try self.bindBlob(idx, value.data);
+                } else {
+                    @compileError("unsupported struct type for binding");
+                }
+            },
+            .pointer => |ptr| {
+                if (ptr.size == .slice and ptr.child == u8) {
+                    try self.bindText(idx, value);
+                } else if (ptr.size == .one) {
+                    const child_info = @typeInfo(ptr.child);
+                    if (child_info == .array and child_info.array.child == u8) {
+                        try self.bindText(idx, value);
+                    } else {
+                        @compileError("unsupported pointer type for binding");
+                    }
+                } else {
+                    @compileError("unsupported pointer type for binding");
+                }
+            },
+            else => @compileError("unsupported type for binding: " ++ @typeName(T)),
+        }
+    }
+
     // -- Column extraction --
 
     pub fn columnText(self: *Statement, idx: u32) ?[]const u8 {
@@ -418,6 +522,15 @@ pub const Statement = struct {
         return @enumFromInt(c.sqlite3_column_type(self.stmt, @intCast(idx)));
     }
 
+    // -- Expanded SQL --
+
+    pub fn expandedSql(self: *Statement, allocator: std.mem.Allocator) ![]const u8 {
+        const ptr = c.sqlite3_expanded_sql(self.stmt) orelse return SqliteError.NoMem;
+        defer c.sqlite3_free(ptr);
+        const slice = std.mem.sliceTo(ptr, 0);
+        return allocator.dupe(u8, slice);
+    }
+
     // -- Step and reset --
 
     pub fn step(self: *Statement) !bool {
@@ -432,6 +545,233 @@ pub const Statement = struct {
     pub fn reset(self: *Statement) void {
         _ = c.sqlite3_reset(self.stmt);
         _ = c.sqlite3_clear_bindings(self.stmt);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Row / Rows
+// ---------------------------------------------------------------------------
+
+pub const Row = struct {
+    stmt: *Statement,
+
+    pub fn text(self: Row, idx: u32) ?[]const u8 {
+        return self.stmt.columnText(idx);
+    }
+
+    pub fn blob(self: Row, idx: u32) ?[]const u8 {
+        return self.stmt.columnBlob(idx);
+    }
+
+    pub fn int(self: Row, idx: u32) i64 {
+        return self.stmt.columnInt(idx);
+    }
+
+    pub fn int32(self: Row, idx: u32) i32 {
+        return self.stmt.columnInt32(idx);
+    }
+
+    pub fn float(self: Row, idx: u32) f64 {
+        return self.stmt.columnFloat(idx);
+    }
+
+    pub fn boolean(self: Row, idx: u32) bool {
+        return self.stmt.columnBool(idx);
+    }
+
+    pub fn isNull(self: Row, idx: u32) bool {
+        return self.stmt.columnIsNull(idx);
+    }
+
+    pub fn optionalInt(self: Row, idx: u32) ?i64 {
+        return self.stmt.columnOptionalInt(idx);
+    }
+
+    pub fn optionalInt32(self: Row, idx: u32) ?i32 {
+        return self.stmt.columnOptionalInt32(idx);
+    }
+
+    pub fn optionalFloat(self: Row, idx: u32) ?f64 {
+        return self.stmt.columnOptionalFloat(idx);
+    }
+
+    pub fn columnCount(self: Row) u32 {
+        return self.stmt.columnCount();
+    }
+
+    pub fn columnName(self: Row, idx: u32) ?[]const u8 {
+        return self.stmt.columnName(idx);
+    }
+
+    pub fn columnType(self: Row, idx: u32) ColumnType {
+        return self.stmt.columnType(idx);
+    }
+};
+
+pub const Rows = struct {
+    stmt: Statement,
+    err: ?anyerror = null,
+    done: bool = false,
+
+    pub fn deinit(self: *Rows) void {
+        self.stmt.deinit();
+    }
+
+    pub fn next(self: *Rows) ?Row {
+        if (self.done or self.err != null) return null;
+        const has_row = self.stmt.step() catch |e| {
+            self.err = e;
+            return null;
+        };
+        if (!has_row) {
+            self.done = true;
+            return null;
+        }
+        return Row{ .stmt = &self.stmt };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Connection Pool
+// ---------------------------------------------------------------------------
+
+pub const Pool = struct {
+    allocator: std.mem.Allocator,
+    connections: []Database,
+    available: []usize,
+    count: usize,
+    mutex: std.Thread.Mutex,
+    cond: std.Thread.Condition,
+
+    pub const Config = struct {
+        size: usize,
+        path: []const u8,
+        flags: c_int = OpenFlags.DEFAULT,
+        on_connection: ?*const fn (*Database) anyerror!void = null,
+        on_first_connection: ?*const fn (*Database) anyerror!void = null,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Pool {
+        const connections = try allocator.alloc(Database, config.size);
+        errdefer allocator.free(connections);
+        const available = try allocator.alloc(usize, config.size);
+        errdefer allocator.free(available);
+
+        var initialized: usize = 0;
+        errdefer {
+            var j: usize = 0;
+            while (j < initialized) : (j += 1) {
+                connections[j].close();
+            }
+        }
+
+        for (connections, 0..) |*conn, i| {
+            conn.* = try Database.openWithFlags(allocator, config.path, config.flags);
+            initialized = i + 1;
+
+            if (i == 0) {
+                if (config.on_first_connection) |cb| {
+                    try cb(conn);
+                }
+            }
+            if (config.on_connection) |cb| {
+                try cb(conn);
+            }
+            available[i] = i;
+        }
+
+        return .{
+            .allocator = allocator,
+            .connections = connections,
+            .available = available,
+            .count = config.size,
+            .mutex = .{},
+            .cond = .{},
+        };
+    }
+
+    pub fn deinit(self: *Pool) void {
+        for (self.connections) |*conn| {
+            conn.close();
+        }
+        self.allocator.free(self.connections);
+        self.allocator.free(self.available);
+    }
+
+    pub fn acquire(self: *Pool) Conn {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.count == 0) {
+            self.cond.wait(&self.mutex);
+        }
+
+        self.count -= 1;
+        const idx = self.available[self.count];
+        return .{
+            .db = &self.connections[idx],
+            .idx = idx,
+            .pool = self,
+        };
+    }
+
+    pub fn release(self: *Pool, conn: Conn) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.available[self.count] = conn.idx;
+        self.count += 1;
+        self.cond.signal();
+    }
+};
+
+pub const Conn = struct {
+    db: *Database,
+    idx: usize,
+    pool: *Pool,
+
+    pub fn release(self: Conn) void {
+        self.pool.release(self);
+    }
+
+    pub fn exec(self: Conn, sql: []const u8) !void {
+        return self.db.exec(sql);
+    }
+
+    pub fn execZ(self: Conn, sql: [:0]const u8) !void {
+        return self.db.execZ(sql);
+    }
+
+    pub fn prepare(self: Conn, sql: []const u8) !Statement {
+        return self.db.prepare(sql);
+    }
+
+    pub fn execDml(self: Conn, sql: []const u8, args: anytype) !void {
+        return self.db.execDml(sql, args);
+    }
+
+    pub fn query(self: Conn, sql: []const u8, args: anytype) !Statement {
+        return self.db.query(sql, args);
+    }
+
+    pub fn rows(self: Conn, sql: []const u8, args: anytype) !Rows {
+        return self.db.rows(sql, args);
+    }
+
+    pub fn row(self: Conn, sql: []const u8, args: anytype) !Rows {
+        return self.db.row(sql, args);
+    }
+
+    pub fn lastInsertRowId(self: Conn) i64 {
+        return self.db.lastInsertRowId();
+    }
+
+    pub fn changes(self: Conn) i32 {
+        return self.db.changes();
+    }
+
+    pub fn getErrorMessage(self: Conn) []const u8 {
+        return self.db.getErrorMessage();
     }
 };
 
@@ -1042,4 +1382,547 @@ test "columnType returns correct types after stepping" {
     try std.testing.expectEqual(ColumnType.text, stmt.columnType(2));
     try std.testing.expectEqual(ColumnType.blob, stmt.columnType(3));
     try std.testing.expectEqual(ColumnType.null, stmt.columnType(4));
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Expanded SQL
+// ---------------------------------------------------------------------------
+
+test "expandedSql shows bound values" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE esql_test (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+
+    var stmt = try db.prepare("INSERT INTO esql_test (name, age) VALUES (?1, ?2)");
+    defer stmt.deinit();
+
+    try stmt.bindText(1, "Alice");
+    try stmt.bindInt32(2, 30);
+
+    const expanded = try stmt.expandedSql(allocator);
+    defer allocator.free(expanded);
+
+    try std.testing.expectEqualStrings("INSERT INTO esql_test (name, age) VALUES ('Alice', 30)", expanded);
+}
+
+test "expandedSql with null parameter" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE esql_test (id INTEGER PRIMARY KEY, val TEXT)");
+
+    var stmt = try db.prepare("INSERT INTO esql_test (val) VALUES (?1)");
+    defer stmt.deinit();
+
+    try stmt.bindNull(1);
+
+    const expanded = try stmt.expandedSql(allocator);
+    defer allocator.free(expanded);
+
+    try std.testing.expectEqualStrings("INSERT INTO esql_test (val) VALUES (NULL)", expanded);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Comptime Tuple Binding
+// ---------------------------------------------------------------------------
+
+test "bind with mixed types" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE bind_test (name TEXT, age INTEGER, score REAL, active INTEGER)");
+
+    var stmt = try db.prepare("INSERT INTO bind_test VALUES (?1, ?2, ?3, ?4)");
+    defer stmt.deinit();
+
+    try stmt.bind(.{ "Alice", @as(i32, 30), @as(f64, 95.5), true });
+    _ = try stmt.step();
+
+    var sel = try db.prepare("SELECT name, age, score, active FROM bind_test");
+    defer sel.deinit();
+
+    const has_row = try sel.step();
+    try std.testing.expect(has_row);
+    try std.testing.expectEqualStrings("Alice", sel.columnText(0).?);
+    try std.testing.expectEqual(@as(i64, 30), sel.columnInt(1));
+    try std.testing.expectApproxEqRel(@as(f64, 95.5), sel.columnFloat(2), 1e-12);
+    try std.testing.expect(sel.columnBool(3));
+}
+
+test "execDml insert and verify" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE dml_test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)");
+
+    try db.execDml("INSERT INTO dml_test (name, value) VALUES (?1, ?2)", .{ "Bob", @as(i64, 42) });
+    try db.execDml("INSERT INTO dml_test (name, value) VALUES (?1, ?2)", .{ "Carol", @as(i64, 99) });
+
+    var stmt = try db.prepare("SELECT COUNT(*) FROM dml_test");
+    defer stmt.deinit();
+    _ = try stmt.step();
+    try std.testing.expectEqual(@as(i64, 2), stmt.columnInt(0));
+
+    var sel = try db.prepare("SELECT name, value FROM dml_test ORDER BY id");
+    defer sel.deinit();
+    _ = try sel.step();
+    try std.testing.expectEqualStrings("Bob", sel.columnText(0).?);
+    try std.testing.expectEqual(@as(i64, 42), sel.columnInt(1));
+}
+
+test "query with params" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE query_test (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)");
+    try db.execDml("INSERT INTO query_test (name, score) VALUES (?1, ?2)", .{ "Alice", @as(i32, 90) });
+    try db.execDml("INSERT INTO query_test (name, score) VALUES (?1, ?2)", .{ "Bob", @as(i32, 80) });
+    try db.execDml("INSERT INTO query_test (name, score) VALUES (?1, ?2)", .{ "Carol", @as(i32, 70) });
+
+    var stmt = try db.query("SELECT name, score FROM query_test WHERE score >= ?1", .{@as(i32, 80)});
+    defer stmt.deinit();
+
+    var count: u32 = 0;
+    while (try stmt.step()) {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "bind with null values" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE null_test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)");
+
+    try db.execDml("INSERT INTO null_test (name, value) VALUES (?1, ?2)", .{ null, @as(?i64, null) });
+
+    var stmt = try db.prepare("SELECT name, value FROM null_test WHERE id = 1");
+    defer stmt.deinit();
+    _ = try stmt.step();
+
+    try std.testing.expect(stmt.columnText(0) == null);
+    try std.testing.expect(stmt.columnIsNull(1));
+}
+
+test "bind with Blob marker" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE blob_bind_test (id INTEGER PRIMARY KEY, data BLOB)");
+
+    const blob_data = &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    try db.execDml("INSERT INTO blob_bind_test (data) VALUES (?1)", .{Blob{ .data = blob_data }});
+
+    var stmt = try db.prepare("SELECT data FROM blob_bind_test WHERE id = 1");
+    defer stmt.deinit();
+    _ = try stmt.step();
+
+    const result = stmt.columnBlob(0);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualSlices(u8, blob_data, result.?);
+}
+
+test "bind with Blob null" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE blob_bind_test (id INTEGER PRIMARY KEY, data BLOB)");
+
+    try db.execDml("INSERT INTO blob_bind_test (data) VALUES (?1)", .{Blob{ .data = null }});
+
+    var stmt = try db.prepare("SELECT data FROM blob_bind_test WHERE id = 1");
+    defer stmt.deinit();
+    _ = try stmt.step();
+
+    try std.testing.expect(stmt.columnBlob(0) == null);
+}
+
+test "bind with optional values" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE opt_test (id INTEGER PRIMARY KEY, val INTEGER, name TEXT)");
+
+    // With values present
+    try db.execDml(
+        "INSERT INTO opt_test (val, name) VALUES (?1, ?2)",
+        .{ @as(?i64, 123), @as(?[]const u8, "present") },
+    );
+
+    // With null values
+    try db.execDml(
+        "INSERT INTO opt_test (val, name) VALUES (?1, ?2)",
+        .{ @as(?i64, null), @as(?[]const u8, null) },
+    );
+
+    var stmt = try db.prepare("SELECT val, name FROM opt_test ORDER BY id");
+    defer stmt.deinit();
+
+    _ = try stmt.step();
+    try std.testing.expectEqual(@as(?i64, 123), stmt.columnOptionalInt(0));
+    try std.testing.expectEqualStrings("present", stmt.columnText(1).?);
+
+    _ = try stmt.step();
+    try std.testing.expect(stmt.columnOptionalInt(0) == null);
+    try std.testing.expect(stmt.columnText(1) == null);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Row/Rows Iterators
+// ---------------------------------------------------------------------------
+
+test "Rows iterates over multiple rows" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE rows_test (id INTEGER PRIMARY KEY, name TEXT)");
+    try db.execDml("INSERT INTO rows_test (name) VALUES (?1)", .{"Alice"});
+    try db.execDml("INSERT INTO rows_test (name) VALUES (?1)", .{"Bob"});
+    try db.execDml("INSERT INTO rows_test (name) VALUES (?1)", .{"Carol"});
+
+    const expected = [_][]const u8{ "Alice", "Bob", "Carol" };
+    var result = try db.rows("SELECT name FROM rows_test ORDER BY id", .{});
+    defer result.deinit();
+
+    var count: u32 = 0;
+    while (result.next()) |row| {
+        try std.testing.expectEqualStrings(expected[count], row.text(0).?);
+        count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, 3), count);
+}
+
+test "Rows returns null when exhausted" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE rows_test (id INTEGER PRIMARY KEY, name TEXT)");
+    try db.execDml("INSERT INTO rows_test (name) VALUES (?1)", .{"only"});
+
+    var result = try db.rows("SELECT name FROM rows_test", .{});
+    defer result.deinit();
+
+    const first = result.next();
+    try std.testing.expect(first != null);
+    try std.testing.expectEqualStrings("only", first.?.text(0).?);
+
+    const second = result.next();
+    try std.testing.expect(second == null);
+
+    const third = result.next();
+    try std.testing.expect(third == null);
+}
+
+test "Row accessors delegate correctly" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE row_test (t TEXT, b BLOB, i INTEGER, f REAL, flag INTEGER, n INTEGER)");
+    const blob_data = &[_]u8{ 0xDE, 0xAD };
+    try db.execDml(
+        "INSERT INTO row_test VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        .{ "hello", Blob{ .data = blob_data }, @as(i64, 42), @as(f64, 3.14), true, null },
+    );
+
+    var result = try db.rows("SELECT t, b, i, f, flag, n FROM row_test", .{});
+    defer result.deinit();
+
+    const row = result.next().?;
+    try std.testing.expectEqualStrings("hello", row.text(0).?);
+    try std.testing.expectEqualSlices(u8, blob_data, row.blob(1).?);
+    try std.testing.expectEqual(@as(i64, 42), row.int(2));
+    try std.testing.expectApproxEqRel(@as(f64, 3.14), row.float(3), 1e-12);
+    try std.testing.expect(row.boolean(4));
+    try std.testing.expect(row.isNull(5));
+    try std.testing.expect(row.optionalInt(5) == null);
+}
+
+test "Rows err is null on success" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE rows_test (id INTEGER PRIMARY KEY)");
+    try db.execDml("INSERT INTO rows_test DEFAULT VALUES", .{});
+
+    var result = try db.rows("SELECT id FROM rows_test", .{});
+    defer result.deinit();
+
+    while (result.next()) |_| {}
+
+    try std.testing.expect(result.err == null);
+}
+
+test "Database.rows convenience" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE rows_test (id INTEGER PRIMARY KEY, score INTEGER)");
+    try db.execDml("INSERT INTO rows_test (score) VALUES (?1)", .{@as(i32, 90)});
+    try db.execDml("INSERT INTO rows_test (score) VALUES (?1)", .{@as(i32, 80)});
+    try db.execDml("INSERT INTO rows_test (score) VALUES (?1)", .{@as(i32, 70)});
+
+    var result = try db.rows("SELECT score FROM rows_test WHERE score >= ?1", .{@as(i32, 80)});
+    defer result.deinit();
+
+    var count: u32 = 0;
+    while (result.next()) |_| {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "Rows with empty result" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE rows_test (id INTEGER PRIMARY KEY, name TEXT)");
+
+    var result = try db.rows("SELECT name FROM rows_test", .{});
+    defer result.deinit();
+
+    const first = result.next();
+    try std.testing.expect(first == null);
+    try std.testing.expect(result.err == null);
+}
+
+test "Database.row single-row convenience" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE row_conv (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)");
+    try db.execDml("INSERT INTO row_conv (name, score) VALUES (?1, ?2)", .{ "Alice", @as(i32, 95) });
+    try db.execDml("INSERT INTO row_conv (name, score) VALUES (?1, ?2)", .{ "Bob", @as(i32, 80) });
+
+    var result = try db.row("SELECT name, score FROM row_conv WHERE id = ?1", .{@as(i64, 1)});
+    defer result.deinit();
+
+    if (result.next()) |r| {
+        try std.testing.expectEqualStrings("Alice", r.text(0).?);
+        try std.testing.expectEqual(@as(i32, 95), r.int32(1));
+    } else {
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "Database.row returns null for no match" {
+    const allocator = std.testing.allocator;
+    var db = try Database.open(allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE row_conv (id INTEGER PRIMARY KEY, name TEXT)");
+
+    var result = try db.row("SELECT name FROM row_conv WHERE id = ?1", .{@as(i64, 999)});
+    defer result.deinit();
+
+    try std.testing.expect(result.next() == null);
+    try std.testing.expect(result.err == null);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Connection Pool
+// ---------------------------------------------------------------------------
+
+test "Pool init and deinit" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/pool_test.db", .{db_path});
+    defer allocator.free(full_path);
+
+    var pool = try Pool.init(allocator, .{ .size = 2, .path = full_path });
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), pool.count);
+}
+
+test "Pool acquire and release" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/pool_test.db", .{db_path});
+    defer allocator.free(full_path);
+
+    var pool = try Pool.init(allocator, .{ .size = 2, .path = full_path });
+    defer pool.deinit();
+
+    const conn = pool.acquire();
+    try conn.exec("CREATE TABLE IF NOT EXISTS acq_test (id INTEGER PRIMARY KEY)");
+    conn.release();
+
+    try std.testing.expectEqual(@as(usize, 2), pool.count);
+}
+
+test "Pool multiple acquire release cycles" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/pool_test.db", .{db_path});
+    defer allocator.free(full_path);
+
+    var pool = try Pool.init(allocator, .{ .size = 2, .path = full_path });
+    defer pool.deinit();
+
+    {
+        const conn = pool.acquire();
+        try conn.exec("CREATE TABLE IF NOT EXISTS cycle_test (id INTEGER PRIMARY KEY, val TEXT)");
+        try conn.exec("INSERT INTO cycle_test (val) VALUES ('first')");
+        conn.release();
+    }
+
+    {
+        const conn = pool.acquire();
+        try conn.exec("INSERT INTO cycle_test (val) VALUES ('second')");
+        conn.release();
+    }
+
+    {
+        const conn = pool.acquire();
+        var stmt = try conn.prepare("SELECT COUNT(*) FROM cycle_test");
+        defer stmt.deinit();
+        _ = try stmt.step();
+        try std.testing.expectEqual(@as(i64, 2), stmt.columnInt(0));
+        conn.release();
+    }
+}
+
+fn poolTestOnConnection(db: *Database) anyerror!void {
+    try db.exec("INSERT INTO pool_cb_track (source) VALUES ('on_connection')");
+}
+
+fn poolTestOnFirstConnection(db: *Database) anyerror!void {
+    try db.exec("CREATE TABLE IF NOT EXISTS pool_cb_track (id INTEGER PRIMARY KEY, source TEXT)");
+}
+
+test "Pool on_connection callback fires" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/pool_cb_test.db", .{db_path});
+    defer allocator.free(full_path);
+
+    var pool = try Pool.init(allocator, .{
+        .size = 3,
+        .path = full_path,
+        .on_first_connection = &poolTestOnFirstConnection,
+        .on_connection = &poolTestOnConnection,
+    });
+    defer pool.deinit();
+
+    const conn = pool.acquire();
+    var stmt = try conn.prepare("SELECT COUNT(*) FROM pool_cb_track WHERE source = 'on_connection'");
+    defer stmt.deinit();
+    _ = try stmt.step();
+    try std.testing.expectEqual(@as(i64, 3), stmt.columnInt(0));
+    conn.release();
+}
+
+test "Pool on_first_connection fires once" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/pool_first_test.db", .{db_path});
+    defer allocator.free(full_path);
+
+    var pool = try Pool.init(allocator, .{
+        .size = 3,
+        .path = full_path,
+        .on_first_connection = &poolTestOnFirstConnection,
+        .on_connection = &poolTestOnConnection,
+    });
+    defer pool.deinit();
+
+    // on_first_connection created the table, on_connection inserted 3 rows (one per connection).
+    // The table existing proves on_first_connection ran. Having 3 rows proves on_connection
+    // ran for each connection. If on_first_connection ran more than once, the CREATE TABLE
+    // IF NOT EXISTS would still succeed, but having exactly 3 rows from on_connection
+    // confirms on_connection ran 3 times total.
+    const conn = pool.acquire();
+    var stmt = try conn.prepare("SELECT COUNT(*) FROM pool_cb_track");
+    defer stmt.deinit();
+    _ = try stmt.step();
+    try std.testing.expectEqual(@as(i64, 3), stmt.columnInt(0));
+    conn.release();
+}
+
+test "Conn delegates to Database" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/pool_delegate_test.db", .{db_path});
+    defer allocator.free(full_path);
+
+    var pool = try Pool.init(allocator, .{ .size = 1, .path = full_path });
+    defer pool.deinit();
+
+    const conn = pool.acquire();
+    defer conn.release();
+
+    // exec
+    try conn.exec("CREATE TABLE delegate_test (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)");
+
+    // execDml
+    try conn.execDml("INSERT INTO delegate_test (name, score) VALUES (?1, ?2)", .{ "Alice", @as(i32, 90) });
+    try std.testing.expectEqual(@as(i32, 1), conn.changes());
+
+    const row_id = conn.lastInsertRowId();
+    try std.testing.expectEqual(@as(i64, 1), row_id);
+
+    // prepare
+    var stmt = try conn.prepare("INSERT INTO delegate_test (name, score) VALUES (?1, ?2)");
+    defer stmt.deinit();
+    try stmt.bind(.{ "Bob", @as(i32, 80) });
+    _ = try stmt.step();
+
+    // rows
+    var result = try conn.rows("SELECT name FROM delegate_test ORDER BY id", .{});
+    defer result.deinit();
+
+    var count: u32 = 0;
+    while (result.next()) |_| {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 2), count);
 }

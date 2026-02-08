@@ -12,6 +12,10 @@ This document covers the features added to zqlite beyond the original core API (
 - [Multi-Statement Detection](#multi-statement-detection)
 - [Configurable Open Flags](#configurable-open-flags)
 - [Column Metadata](#column-metadata)
+- [Expanded SQL](#expanded-sql)
+- [Comptime Tuple Binding](#comptime-tuple-binding)
+- [Row/Rows Iterators](#rowrows-iterators)
+- [Connection Pool](#connection-pool)
 - [API Quick Reference](#api-quick-reference)
 
 ---
@@ -409,6 +413,292 @@ if (try stmt.step()) {
 
 ---
 
+## Expanded SQL
+
+Retrieve the SQL string with all bound parameter values substituted in. Wraps `sqlite3_expanded_sql()`. Useful for debugging, logging, and error reporting.
+
+### Method
+
+```zig
+pub fn expandedSql(self: *Statement, allocator: std.mem.Allocator) ![]const u8
+```
+
+Returns a caller-owned slice. The caller must free it with `allocator.free()`.
+
+Returns `SqliteError.NoMem` if SQLite cannot generate the expanded string (out of memory).
+
+### Example: Logging Bound Queries
+
+```zig
+var stmt = try db.prepare("INSERT INTO users (name, age) VALUES (?1, ?2)");
+defer stmt.deinit();
+
+try stmt.bindText(1, "Alice");
+try stmt.bindInt32(2, 30);
+
+const expanded = try stmt.expandedSql(allocator);
+defer allocator.free(expanded);
+// expanded == "INSERT INTO users (name, age) VALUES ('Alice', 30)"
+
+std.log.info("executing: {s}", .{expanded});
+_ = try stmt.step();
+```
+
+---
+
+## Comptime Tuple Binding
+
+Bind parameters using a Zig tuple instead of individual `bindText`/`bindInt` calls. Uses `inline for` with comptime type dispatch -- zero runtime overhead.
+
+This is an ergonomic layer on top of the existing individual bind methods, which remain available.
+
+### Statement.bind()
+
+```zig
+pub fn bind(self: *Statement, args: anytype) !void
+```
+
+Binds each tuple field to a positional parameter (1-indexed). Type dispatch:
+
+| Zig Type | Binds As |
+|----------|----------|
+| `[]const u8`, string literals | TEXT (via `bindText`) |
+| `i32` and smaller signed ints | INTEGER 32-bit (via `bindInt32`) |
+| `i64` and larger ints | INTEGER 64-bit (via `bindInt`) |
+| `comptime_int` | i32 or i64 based on value range |
+| `f64`, `comptime_float` | REAL (via `bindFloat`) |
+| `bool` | INTEGER 0/1 (via `bindBool`) |
+| `null` | NULL (via `bindNull`) |
+| `?T` (optionals) | Unwraps to T or NULL |
+| `Blob` | BLOB (via `bindBlob`) |
+
+### Blob Marker Type
+
+To distinguish blob data from text (both are `[]const u8`), use the `Blob` marker:
+
+```zig
+const zqlite = @import("zqlite");
+
+try stmt.bind(.{ zqlite.Blob{ .data = &raw_bytes } });
+try stmt.bind(.{ zqlite.Blob{ .data = null } }); // NULL blob
+```
+
+### Database.execDml()
+
+```zig
+pub fn execDml(self: *Database, sql: []const u8, args: anytype) !void
+```
+
+One-shot prepare + bind + step for INSERT/UPDATE/DELETE. The statement is automatically finalized.
+
+```zig
+try db.execDml("INSERT INTO users (name, age) VALUES (?1, ?2)", .{ "Alice", 30 });
+try db.execDml("UPDATE users SET age = ?1 WHERE name = ?2", .{ 31, "Alice" });
+try db.execDml("DELETE FROM users WHERE name = ?1", .{"Alice"});
+```
+
+### Database.query()
+
+```zig
+pub fn query(self: *Database, sql: []const u8, args: anytype) !Statement
+```
+
+Prepare + bind, returning the Statement ready for stepping. Caller owns the Statement.
+
+```zig
+var stmt = try db.query("SELECT name, age FROM users WHERE age > ?1", .{25});
+defer stmt.deinit();
+
+while (try stmt.step()) {
+    const name = stmt.columnText(0);
+    const age = stmt.columnInt32(1);
+    _ = .{ name, age };
+}
+```
+
+---
+
+## Row/Rows Iterators
+
+Ergonomic types for iterating query results. `Row` provides short method names for column access. `Rows` is an iterator that accumulates errors internally so callers can use a plain `while` loop.
+
+### Row
+
+A non-owning view over a Statement. Provides shorter method names that delegate to the underlying column methods.
+
+| Method | Returns | Delegates To |
+|--------|---------|-------------|
+| `text(idx)` | `?[]const u8` | `columnText` |
+| `blob(idx)` | `?[]const u8` | `columnBlob` |
+| `int(idx)` | `i64` | `columnInt` |
+| `int32(idx)` | `i32` | `columnInt32` |
+| `float(idx)` | `f64` | `columnFloat` |
+| `boolean(idx)` | `bool` | `columnBool` |
+| `isNull(idx)` | `bool` | `columnIsNull` |
+| `optionalInt(idx)` | `?i64` | `columnOptionalInt` |
+| `optionalInt32(idx)` | `?i32` | `columnOptionalInt32` |
+| `optionalFloat(idx)` | `?f64` | `columnOptionalFloat` |
+| `columnCount()` | `u32` | `columnCount` |
+| `columnName(idx)` | `?[]const u8` | `columnName` |
+| `columnType(idx)` | `ColumnType` | `columnType` |
+
+Row does **not** have a `deinit()` method. Its lifetime is tied to the parent Rows iterator.
+
+### Rows
+
+An iterator that owns a Statement. Accumulates errors internally so the iteration loop stays clean.
+
+```zig
+pub const Rows = struct {
+    stmt: Statement,
+    err: ?anyerror = null,
+    done: bool = false,
+
+    pub fn deinit(self: *Rows) void;
+    pub fn next(self: *Rows) ?Row;
+};
+```
+
+### Database.rows()
+
+```zig
+pub fn rows(self: *Database, sql: []const u8, args: anytype) !Rows
+```
+
+Prepare + bind + return a Rows iterator. Caller must call `deinit()`.
+
+### Database.row()
+
+```zig
+pub fn row(self: *Database, sql: []const u8, args: anytype) !Rows
+```
+
+Convenience for single-row queries. Returns a Rows iterator -- call `next()` once.
+
+### Example: Iterating Multiple Rows
+
+```zig
+var result = try db.rows("SELECT name, score FROM players WHERE score > ?1", .{100});
+defer result.deinit();
+
+while (result.next()) |r| {
+    const name = r.text(0) orelse "(unknown)";
+    const score = r.int(1);
+    std.debug.print("{s}: {d}\n", .{ name, score });
+}
+if (result.err) |err| return err;
+```
+
+### Example: Single Row Lookup
+
+```zig
+var result = try db.row("SELECT name, age FROM users WHERE id = ?1", .{user_id});
+defer result.deinit();
+
+if (result.next()) |r| {
+    const name = r.text(0);
+    const age = r.int32(1);
+    _ = .{ name, age };
+} else {
+    // No matching row
+}
+```
+
+### Lifetime Note
+
+The Row returned by `next()` borrows the Rows iterator's internal Statement. It is only valid until the next call to `next()` or `deinit()`. Do not store Row references across iterations.
+
+---
+
+## Connection Pool
+
+Thread-safe fixed-size connection pool for multi-threaded applications. Uses `std.Thread.Mutex` and `std.Thread.Condition` for synchronization. LIFO stack internally (most recently released connection is next acquired).
+
+### Pool.Config
+
+```zig
+pub const Config = struct {
+    size: usize,                                              // Number of connections
+    path: []const u8,                                         // Database file path
+    flags: c_int = OpenFlags.DEFAULT,                         // Open flags
+    on_connection: ?*const fn (*Database) anyerror!void = null,       // Runs per-connection
+    on_first_connection: ?*const fn (*Database) anyerror!void = null, // Runs once on first
+};
+```
+
+### Pool.init() / Pool.deinit()
+
+```zig
+var pool = try zqlite.Pool.init(allocator, .{
+    .size = 5,
+    .path = "/tmp/mydb.sqlite",
+    .on_first_connection = &setupSchema,
+    .on_connection = &configureConn,
+});
+defer pool.deinit();
+```
+
+`init()` opens all connections, runs `on_first_connection` on the first one, and `on_connection` on each. Uses `errdefer` to clean up partially initialized connections on failure.
+
+### Pool.acquire() / Conn.release()
+
+```zig
+var conn = pool.acquire();  // Blocks if all connections in use
+defer conn.release();
+
+try conn.exec("INSERT INTO logs (msg) VALUES ('hello')");
+```
+
+`acquire()` blocks via condition variable when all connections are in use. `release()` returns the connection to the pool and signals one waiter.
+
+### Conn
+
+A pool-aware wrapper around `*Database`. Provides the same API surface:
+
+| Method | Description |
+|--------|-------------|
+| `release()` | Return connection to pool |
+| `exec(sql)` | Execute raw SQL |
+| `execZ(sql)` | Execute null-terminated SQL |
+| `prepare(sql)` | Prepare a statement |
+| `execDml(sql, args)` | One-shot DML with tuple binding |
+| `query(sql, args)` | Prepare + bind, return Statement |
+| `rows(sql, args)` | Prepare + bind, return Rows iterator |
+| `lastInsertRowId()` | Last inserted rowid |
+| `changes()` | Rows affected by last DML |
+| `getErrorMessage()` | Last SQLite error message |
+
+### Example: Multi-Threaded Usage
+
+```zig
+const zqlite = @import("zqlite");
+
+var pool = try zqlite.Pool.init(allocator, .{
+    .size = 4,
+    .path = "app.db",
+    .on_first_connection = &struct {
+        fn f(db: *zqlite.Database) !void {
+            try db.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)");
+        }
+    }.f,
+});
+defer pool.deinit();
+
+// Each thread acquires its own connection
+var conn = pool.acquire();
+defer conn.release();
+
+try conn.execDml("INSERT INTO kv (k, v) VALUES (?1, ?2)", .{ "key1", "value1" });
+
+var result = try conn.rows("SELECT k, v FROM kv", .{});
+defer result.deinit();
+while (result.next()) |row| {
+    _ = row.text(0);
+}
+```
+
+---
+
 ## API Quick Reference
 
 All methods added by the features documented above.
@@ -426,6 +716,10 @@ All methods added by the features documented above.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `openWithFlags` | `(allocator, path, flags: c_int) !Database` | Open with custom SQLite flags |
+| `execDml` | `(sql, args) !void` | One-shot prepare + bind + step for DML |
+| `query` | `(sql, args) !Statement` | Prepare + bind, return Statement |
+| `rows` | `(sql, args) !Rows` | Prepare + bind, return Rows iterator |
+| `row` | `(sql, args) !Rows` | Convenience for single-row queries |
 
 ### Statement Binding Methods
 
@@ -434,6 +728,8 @@ All methods added by the features documented above.
 | `bindBlob` | `(idx: u32, value: ?[]const u8) !void` | Bind raw bytes or NULL |
 | `bindFloat` | `(idx: u32, value: f64) !void` | Bind a double |
 | `bindOptionalFloat` | `(idx: u32, value: ?f64) !void` | Bind a double or NULL |
+| `bind` | `(args: anytype) !void` | Bind all tuple fields to positional params |
+| `expandedSql` | `(allocator) ![]const u8` | SQL with bound values substituted |
 
 ### Statement Column Methods
 
@@ -445,3 +741,44 @@ All methods added by the features documented above.
 | `columnCount` | `() u32` | Number of result columns |
 | `columnName` | `(idx: u32) ?[]const u8` | Name of column at index |
 | `columnType` | `(idx: u32) ColumnType` | Storage class of current value |
+
+### Row Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `text` | `(idx: u32) ?[]const u8` | Read text column |
+| `blob` | `(idx: u32) ?[]const u8` | Read blob column |
+| `int` | `(idx: u32) i64` | Read 64-bit integer |
+| `int32` | `(idx: u32) i32` | Read 32-bit integer |
+| `float` | `(idx: u32) f64` | Read double |
+| `boolean` | `(idx: u32) bool` | Read boolean (0/1) |
+| `isNull` | `(idx: u32) bool` | Check if column is NULL |
+| `optionalInt` | `(idx: u32) ?i64` | Read nullable 64-bit integer |
+| `optionalInt32` | `(idx: u32) ?i32` | Read nullable 32-bit integer |
+| `optionalFloat` | `(idx: u32) ?f64` | Read nullable double |
+
+### Rows Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `next` | `() ?Row` | Advance to next row, null when done |
+| `deinit` | `() void` | Finalize underlying statement |
+
+### Pool Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Pool.init` | `(allocator, Config) !Pool` | Create pool with N connections |
+| `Pool.deinit` | `() void` | Close all connections, free memory |
+| `Pool.acquire` | `() Conn` | Get a connection (blocks if none available) |
+
+### Conn Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `release` | `() void` | Return connection to pool |
+| `exec` | `(sql) !void` | Execute raw SQL |
+| `prepare` | `(sql) !Statement` | Prepare a statement |
+| `execDml` | `(sql, args) !void` | One-shot DML with tuple binding |
+| `query` | `(sql, args) !Statement` | Prepare + bind, return Statement |
+| `rows` | `(sql, args) !Rows` | Prepare + bind, return Rows iterator |
