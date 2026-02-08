@@ -2,26 +2,38 @@ const std = @import("std");
 const zqlite = @import("zqlite");
 
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try zqlite.bufferedPrint();
-}
+    const allocator = std.heap.page_allocator;
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    var db = try zqlite.Database.open(allocator, ":memory:");
+    defer db.close();
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    try db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+
+    var insert = try db.prepare("INSERT INTO users (name, age) VALUES (?1, ?2)");
+    defer insert.deinit();
+
+    try insert.bindText(1, "Alice");
+    try insert.bindInt32(2, 30);
+    _ = try insert.step();
+    insert.reset();
+
+    try insert.bindText(1, "Bob");
+    try insert.bindInt32(2, 25);
+    _ = try insert.step();
+
+    var query = try db.prepare("SELECT name, age FROM users ORDER BY name");
+    defer query.deinit();
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    try stdout.print("Users:\n", .{});
+    while (try query.step()) {
+        const name = query.columnText(0) orelse "(null)";
+        const age = query.columnInt32(1);
+        try stdout.print("  {s}, age {d}\n", .{ name, age });
+    }
+
+    try stdout.flush();
 }

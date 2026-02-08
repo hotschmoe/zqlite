@@ -141,9 +141,13 @@ jobs:
 
           mkdir -p src
           cat > src/main.zig << 'EOF'
+          const std = @import("std");
           const zqlite = @import("zqlite");
           pub fn main() !void {
-              _ = zqlite.add(1, 2);
+              const allocator = std.heap.page_allocator;
+              var db = try zqlite.Database.open(allocator, ":memory:");
+              defer db.close();
+              try db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY)");
           }
           EOF
 
