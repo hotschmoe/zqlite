@@ -11,8 +11,6 @@ Both are thin Zig wrappers around SQLite's C API. Same goal, different trade-off
 - [Architectural Differences](#architectural-differences)
 - [Integrated Features](#integrated-features)
 - [Remaining Gaps](#remaining-gaps)
-  - [P1 - Medium Value](#p1---medium-value)
-  - [P2 - Design Questions](#p2---design-questions)
 - [Our Advantages](#our-advantages)
 - [API Comparison](#api-comparison)
   - [Opening a Database](#opening-a-database)
@@ -34,12 +32,13 @@ Both are thin Zig wrappers around SQLite's C API. Same goal, different trade-off
 | SQLite bundling     | Bundled in vendor/         | Not bundled; consumer links   |
 | Allocator           | Required for open()        | Not needed for core ops       |
 | PRAGMA auto-config  | WAL, FK, busy_timeout, etc | None; consumer handles all    |
-| Source layout        | 1 file (root.zig, ~1050 ln)| 3 files (~1300 ln total)      |
+| Source layout        | 1 file (root.zig, ~1900 ln)| 3 files (~1300 ln total)      |
 | Open flags          | sqlite3_open_v2 + OpenFlags| 20+ flags (sqlite3_open_v2)   |
-| Binding strategy    | Individual typed methods   | Comptime tuple dispatch       |
+| Binding strategy    | Individual + comptime tuple| Comptime tuple dispatch       |
 | Text/blob binding   | SQLITE_TRANSIENT (copies)  | SQLITE_STATIC (zero-copy)     |
 | Error granularity   | 35 errors (primary+ext)    | 97 errors (primary+extended)  |
-| Connection pooling  | Not implemented            | Built-in Pool type            |
+| Connection pooling  | Built-in Pool/Conn types   | Built-in Pool type            |
+| Row iteration       | Row/Rows + raw Statement   | Row/Rows types                |
 +---------------------+----------------------------+-------------------------------+
 ```
 
@@ -47,7 +46,7 @@ Both are thin Zig wrappers around SQLite's C API. Same goal, different trade-off
 
 ## Integrated Features
 
-These features from the original gap analysis have been implemented in v0.2.0.
+Features from the original gap analysis implemented across v0.2.0 and v0.3.0.
 
 ### [DONE] 1. Granular Error Types
 
@@ -162,92 +161,108 @@ Default includes `EXRESCODE` so extended result codes work out of the box with o
 
 **Parity with karlseguin**: Full parity. Same flag set, same `sqlite3_open_v2` backend. We additionally auto-configure PRAGMAs after opening.
 
----
+### [DONE] 7. Expanded SQL for Debugging
 
-## Remaining Gaps
-
-### P1 - Medium Value
-
-#### 7. Expanded SQL for Debugging
-
-**Current state**: Not implemented.
-
-**karlseguin's approach**:
+**Implemented in**: v0.3.0 (commit 42089dd)
 
 ```zig
-const sql = try stmt.expandedSql(allocator);
-defer allocator.free(sql);
+const expanded = try stmt.expandedSql(allocator);
+defer allocator.free(expanded);
 // e.g. "INSERT INTO t (name, age) VALUES ('Alice', 30)"
 ```
 
-Wraps `sqlite3_expanded_sql`. This is the only method in karlseguin's library that takes an allocator -- it copies the result from SQLite's internal buffer and frees the original with `sqlite3_free`.
+Wraps `sqlite3_expanded_sql`. Returns caller-owned memory (freed with `allocator.free`). The SQLite-allocated string is freed internally with `sqlite3_free` after copying. Returns `SqliteError.NoMem` if SQLite cannot generate the expansion.
 
-**Use cases**: Debugging, logging, error reporting.
-
-**Scope**: Small. One new method.
+**Parity with karlseguin**: Full parity. Same approach -- allocator-based copy of the SQLite-managed string.
 
 ---
 
-### P2 - Design Questions
+### [DONE] 5. Connection Pooling
 
-These are not clear-cut improvements -- they involve trade-offs worth discussing.
-
-#### 5. Connection Pooling
-
-**Current state**: Not implemented. On our roadmap.
-
-**karlseguin's approach**: Fixed-size pool with `std.Thread.Mutex` and `std.Thread.Condition`:
+**Implemented in**: v0.3.0 (commit 42089dd)
 
 ```zig
 var pool = try zqlite.Pool.init(allocator, .{
     .size = 5,
     .path = "/tmp/db.sqlite",
-    .flags = zqlite.OpenFlags.Create,
-    .on_connection = &initConn,       // runs per-connection (PRAGMAs, etc.)
-    .on_first_connection = &initDB,   // runs once (schema setup)
+    .on_connection = &initConn,
+    .on_first_connection = &initDB,
 });
 defer pool.deinit();
 
-const conn = pool.acquire();  // blocks until available
+var conn = pool.acquire();
 defer conn.release();
+try conn.execDml("INSERT INTO t (a) VALUES (?1)", .{"hello"});
 ```
 
-Design details:
-- Fixed size, LIFO stack internally
-- `acquire()` blocks via condvar when all connections are in use
-- `release()` returns to pool and signals one waiter
-- Each `Conn` has a `_pool` backpointer enabling `conn.release()`
-- Callback system for per-connection and first-connection initialization
+**What we built**: Fixed-size pool with `std.Thread.Mutex` and `std.Thread.Condition`. LIFO stack internally. `acquire()` blocks via condvar when exhausted. `Conn` wrapper delegates the full Database API surface including the new `execDml`, `query`, and `rows` convenience methods.
 
-**Recommendation**: Good reference design. Our auto-PRAGMA system pairs well with `on_connection` callbacks. Consider whether we want fixed-size or growable pools.
+Pool.Config supports:
+- `size` -- number of connections
+- `path` -- database file path
+- `flags` -- OpenFlags (defaults to DEFAULT)
+- `on_connection` -- callback per connection (PRAGMAs, etc.)
+- `on_first_connection` -- callback on first connection only (schema setup)
 
-**Scope**: Large. New type, threading primitives, integration with Database/Conn lifecycle.
+**Difference from karlseguin**: Similar design (fixed-size, mutex/condvar, LIFO, callbacks). Our `Conn` additionally exposes `execDml`, `query`, `rows` from our comptime tuple binding layer. Our auto-PRAGMA system runs automatically on each connection via `Database.openWithFlags`.
 
 ---
 
-#### 9. Comptime Tuple Binding
+### [DONE] 9. Comptime Tuple Binding
 
-**karlseguin's approach**:
+**Implemented in**: v0.3.0 (commit 42089dd)
+
 ```zig
-// One-shot: prepare + bind + step in a single call
-try conn.exec("INSERT INTO t (a, b) VALUES (?1, ?2)", .{"Alice", 42});
+// Bind a tuple to positional parameters
+try stmt.bind(.{ "Alice", 42, 3.14, true });
 
-// Or bind a tuple to an existing statement:
-try stmt.bind(.{"Alice", 42});
+// One-shot DML (prepare + bind + step + finalize)
+try db.execDml("INSERT INTO t (a, b) VALUES (?1, ?2)", .{ "Alice", 42 });
+
+// Prepare + bind, return statement for stepping
+var stmt = try db.query("SELECT * FROM t WHERE a = ?1", .{"Alice"});
+defer stmt.deinit();
 ```
 
-Uses `inline for` over the tuple fields with `@TypeOf` dispatch at comptime. Zero runtime overhead.
+**What we built**: `Statement.bind(tuple)` using `inline for` with comptime `@TypeOf` dispatch. Supports `[]const u8` (text), string literals, `i32`, `i64`, `f64`, `bool`, `null`, optionals, and `Blob` marker type for blob disambiguation. `Database.execDml()` for one-shot DML. `Database.query()` for prepare+bind.
 
-**Trade-offs**:
-- Pro: Dramatically more ergonomic for common cases
-- Pro: Compile-time type checking, no runtime dispatch
-- Con: Less flexible for dynamic/loop-based binding
-- Con: Requires marker type for blob vs text disambiguation
-- Con: Uses `SQLITE_STATIC` (caller must keep data alive until step)
-
-**Recommendation**: Offer both. Keep our explicit `bindText`/`bindInt` methods and layer a `bind(tuple)` convenience on top. Also consider adding one-shot `exec(sql, params)` that prepares, binds, steps, and finalizes.
+**Difference from karlseguin**: We kept the explicit `bindText`/`bindInt` methods alongside the tuple API (both available). We use `SQLITE_TRANSIENT` (safe default) vs their `SQLITE_STATIC`. Our `Blob` marker type serves the same purpose as theirs for blob/text disambiguation.
 
 ---
+
+### [DONE] 12. Row/Rows Separation
+
+**Implemented in**: v0.3.0 (commit 42089dd)
+
+```zig
+// Multiple rows
+var result = try db.rows("SELECT name, score FROM players", .{});
+defer result.deinit();
+while (result.next()) |row| {
+    const name = row.text(0);
+    const score = row.int(1);
+    _ = .{ name, score };
+}
+if (result.err) |err| return err;
+
+// Single row
+var result = try db.row("SELECT name FROM players WHERE id = ?1", .{id});
+defer result.deinit();
+if (result.next()) |row| {
+    const name = row.text(0);
+    _ = name;
+}
+```
+
+**What we built**: `Row` (non-owning view with short method names: `text`, `int`, `float`, `boolean`, `blob`, `isNull`, etc.) and `Rows` (owning iterator with `next() -> ?Row`, error accumulation via `err` field, `done` flag to prevent re-stepping after exhaustion). `Database.rows()` and `Database.row()` convenience methods.
+
+**Difference from karlseguin**: Our `Row` is always non-owning (no deinit) -- simpler ownership rules. `Database.row()` returns `Rows` (call `next()` once) rather than `?Row`, avoiding the ownership problem of who finalizes the statement when no row matches. Our `Rows` has a `done` flag to prevent undefined behavior from stepping after `SQLITE_DONE`.
+
+---
+
+## Remaining Gaps
+
+### Optional -- Discuss First
 
 #### 10. Allocator-Free Core
 
@@ -337,6 +352,10 @@ Features and design choices where our library is ahead:
 | **columnIsNull helper** | Dedicated null-check method. karlseguin requires manual `columnType() == .null` check. |
 | **Optional float support** | `bindOptionalFloat()`, `columnOptionalFloat()`. karlseguin has no optional float methods. |
 | **EXRESCODE by default** | Extended result codes enabled out of the box via default open flags. karlseguin requires consumer to opt in. |
+| **Dual binding API** | Both individual typed methods (`bindText`, `bindInt`) and comptime tuple `bind()`. karlseguin has tuple only. |
+| **TRANSIENT tuple binding** | Our `bind(tuple)` uses `SQLITE_TRANSIENT` (safe). karlseguin uses `SQLITE_STATIC` (caller manages lifetime). |
+| **Simpler Row ownership** | Row is always non-owning. No deinit needed on Row, only on Rows. karlseguin has different ownership rules for `row()` vs `rows().next()`. |
+| **Pool auto-PRAGMAs** | Pool connections get auto-PRAGMA config (WAL, FK, etc.) via Database.openWithFlags. karlseguin requires manual on_connection setup. |
 
 ---
 
@@ -370,10 +389,17 @@ Ours (individual methods):
     try stmt.bindText(1, "Alice");
     try stmt.bindInt(2, 42);
     try stmt.bindBool(3, true);
-    try stmt.bindFloat(4, 3.14);       // NEW in v0.2.0
-    try stmt.bindBlob(5, &raw_bytes);  // NEW in v0.2.0
+    try stmt.bindFloat(4, 3.14);
+    try stmt.bindBlob(5, &raw_bytes);
     try stmt.bindNull(6);
     _ = try stmt.step();
+
+Ours (tuple -- NEW in v0.3.0):
+    try stmt.bind(.{ "Alice", 42, true, 3.14, Blob{.data = &raw_bytes}, null });
+    _ = try stmt.step();
+
+Ours (one-shot -- NEW in v0.3.0):
+    try db.execDml("INSERT INTO t VALUES (?1,?2)", .{ "Alice", 42 });
 
 karlseguin (tuple):
     try conn.exec("INSERT INTO t VALUES (?1,?2,?3,?4)",
@@ -381,26 +407,40 @@ karlseguin (tuple):
 
 karlseguin (individual, on Stmt):
     try stmt.bind(.{"Alice", 42, true, null});
-    // or: try stmt.bindValue("Alice", 1);
 ```
 
 ### Column Extraction
 
 ```
-Ours (v0.2.0):
+Ours (on Statement):
     stmt.columnText(0)          // ?[]const u8
-    stmt.columnBlob(0)          // ?[]const u8      NEW
+    stmt.columnBlob(0)          // ?[]const u8
     stmt.columnInt(0)           // i64
     stmt.columnInt32(0)         // i32
-    stmt.columnFloat(0)         // f64              NEW
+    stmt.columnFloat(0)         // f64
     stmt.columnBool(0)          // bool
     stmt.columnOptionalInt(0)   // ?i64
     stmt.columnOptionalInt32(0) // ?i32
-    stmt.columnOptionalFloat(0) // ?f64             NEW
-    stmt.columnIsNull(0)        // bool             NEW
-    stmt.columnCount()          // u32              NEW
-    stmt.columnName(0)          // ?[]const u8      NEW
-    stmt.columnType(0)          // ColumnType        NEW
+    stmt.columnOptionalFloat(0) // ?f64
+    stmt.columnIsNull(0)        // bool
+    stmt.columnCount()          // u32
+    stmt.columnName(0)          // ?[]const u8
+    stmt.columnType(0)          // ColumnType
+
+Ours (on Row -- NEW in v0.3.0, short names):
+    row.text(0)                 // ?[]const u8
+    row.blob(0)                 // ?[]const u8
+    row.int(0)                  // i64
+    row.int32(0)                // i32
+    row.float(0)                // f64
+    row.boolean(0)              // bool
+    row.optionalInt(0)          // ?i64
+    row.optionalInt32(0)        // ?i32
+    row.optionalFloat(0)        // ?f64
+    row.isNull(0)               // bool
+    row.columnCount()           // u32
+    row.columnName(0)           // ?[]const u8
+    row.columnType(0)           // ColumnType
 
 karlseguin:
     row.text(0)            // []const u8
@@ -418,13 +458,27 @@ karlseguin:
 ### Row Iteration
 
 ```
-Ours:
+Ours (raw Statement -- still available):
     var stmt = try db.prepare("SELECT ...");
     defer stmt.deinit();
     try stmt.bindInt(1, id);
     while (try stmt.step()) {
         const name = stmt.columnText(0);
-        // ...
+    }
+
+Ours (Rows iterator -- NEW in v0.3.0):
+    var result = try db.rows("SELECT ...", .{id});
+    defer result.deinit();
+    while (result.next()) |row| {
+        const name = row.text(0);
+    }
+    if (result.err) |err| return err;
+
+Ours (single row -- NEW in v0.3.0):
+    var result = try db.row("SELECT ...", .{id});
+    defer result.deinit();
+    if (result.next()) |row| {
+        return row.text(0);
     }
 
 karlseguin (iterator):
@@ -503,19 +557,13 @@ karlseguin (97 errors, selected examples):
 ### Priority Order
 
 ```
-Next up (small scope):
-  [7] expandedSql() for debugging
-
-Design work needed (large scope):
-  [5]  Connection pooling
-  [9]  Comptime tuple binding (additive, keep existing API)
-  [12] Row/Rows iterator types
-
 Optional (discuss first):
   [10] openZ() for null-terminated paths
-  [11] SQLITE_STATIC variant methods
-  [13] Generic column getter
+  [11] SQLITE_STATIC variant methods (bindTextStatic, bindBlobStatic)
+  [13] Generic column getter (row.get(T, idx))
 ```
+
+10 of 13 features from the original analysis are now integrated. The 3 remaining are all optional enhancements that involve trade-offs worth discussing before implementation.
 
 ### Principles
 
@@ -528,3 +576,4 @@ Optional (discuss first):
 
 *Original analysis performed Feb 2026. karlseguin/zqlite.zig at latest master.*
 *Updated Feb 2026 after v0.2.0 integration (commit 37c1f05). 6 of 13 features integrated.*
+*Updated Feb 2026 after v0.3.0 integration (commit 42089dd). 10 of 13 features integrated.*
