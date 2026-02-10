@@ -10,6 +10,16 @@ const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
+// SQLITE_TRANSIENT is ((sqlite3_destructor_type)-1) in C.
+// Zig's c_translation cannot safely cast this on cross-compile targets
+// due to function-pointer alignment checks. Define it directly.
+// Use SQLITE_STATIC (null) instead of SQLITE_TRANSIENT.
+// SQLITE_TRANSIENT is ((sqlite3_destructor_type)-1) which Zig cannot
+// represent as a function pointer on cross-compile targets (alignment).
+// SQLITE_STATIC is safe here: callers always step() before releasing
+// bound text data, so the pointer remains valid through execution.
+const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+
 pub const SqliteError = error{
     OpenFailed,
     PrepareFailed,
@@ -122,7 +132,7 @@ pub const Statement = struct {
                 @intCast(idx),
                 v.ptr,
                 @intCast(v.len),
-                c.SQLITE_TRANSIENT,
+                SQLITE_STATIC,
             )
         else
             c.sqlite3_bind_null(self.stmt, @intCast(idx));
